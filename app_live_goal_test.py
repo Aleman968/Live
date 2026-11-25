@@ -3,6 +3,7 @@ import math
 import sqlite3
 import zipfile
 import shutil
+import tempfile
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -18,24 +19,22 @@ st.set_page_config(page_title="Candidate Gol 2T", page_icon="⚽", layout="wide"
 ITALY_TZ = ZoneInfo("Europe/Rome")
 API_BASE = "https://api.football-data-api.com"
 
-O15_MIN = 0.80
+O15_MIN = 0.84
 O25_MIN = 0.60
+LIVE_MIN = 0.80
 
 # Paniere concordato: nessun selettore, queste competizioni sono sempre attive.
 SELECTED_LEAGUES = {
-    "England Premier League",
-    "Spain La Liga",
-    "Italy Serie A",
-    "France Ligue 1",
-    "Portugal Liga NOS",
-    "Turkey Süper Lig",
-    "Norway Eliteserien",
-    "Norway First Division",
-    "Sweden Allsvenskan",
-    "Czech Republic First League",
-    "Europe UEFA Champions League",
-    "Europe UEFA Europa League",
-    "Europe UEFA Europa Conference League",
+    'England Premier League',
+    'Spain La Liga',
+    'Italy Serie A',
+    'Germany Bundesliga',
+    'Germany 2. Bundesliga',
+    'France Ligue 1',
+    'Portugal Liga NOS',
+    'Netherlands Eredivisie',
+    'Netherlands Eerste Divisie',
+    'Belgium Pro League',
 }
 
 CANDIDATE_K = [300, 500, 750, 1000, 1500, 2000, 3000, 5000]
@@ -67,59 +66,131 @@ def get_api_key():
     return (os.getenv("FOOTYSTATS_API_KEY") or os.getenv("API_KEY") or "").strip()
 
 
-def resolve_db_path():
+
+# CONFIGURAZIONE DB PER STREAMLIT CLOUD
+# Il database ottimizzato (352.557 gare) e' incluso in v13_historical.zip.
+# Non sovrascrivere il vecchio .db del repository: lo ZIP aggiornato ha priorita'.
+V13_DATABASE_MIN_MATCHES = 352557
+APP_DIR = Path(__file__).resolve().parent
+
+
+def _configured_v13_db():
     try:
-        configured = st.secrets.get("V13_DB_PATH")
-        if configured:
-            return Path(str(configured)).expanduser()
+        value = st.secrets.get("V13_DB_PATH")
+    except Exception:
+        value = None
+    value = value or os.environ.get("V13_DB_PATH")
+    if value:
+        path = Path(str(value)).expanduser()
+        return path if path.is_absolute() else APP_DIR / path
+    return APP_DIR / "v13_historical.db"
+
+
+def _v13_db_count(path):
+    if not Path(path).is_file():
+        raise FileNotFoundError(f"Database mancante: {path}")
+    with sqlite3.connect(str(path)) as connection:
+        fields = {r[1] for r in connection.execute("PRAGMA table_info(matches_v13)")}
+        needed = {"match_id", "competition_name", "season_id", "date_unix",
+                  "status", "result_1x2", "home_goals", "away_goals",
+                  "ht_goals_team_a", "ht_goals_team_b", "odds_ft_over15",
+                  "odds_ft_under15", "odds_ft_over25", "odds_ft_under25"}
+        missing = sorted(needed - fields)
+        if missing:
+            raise RuntimeError("Colonne mancanti in matches_v13: " + ", ".join(missing))
+        return int(connection.execute("SELECT COUNT(*) FROM matches_v13").fetchone()[0])
+
+
+def _v13_archive_options():
+    found = []
+    for archive in sorted(APP_DIR.glob("v13_historical*.zip")):
+        try:
+            with zipfile.ZipFile(archive, "r") as zf:
+                info = next((m for m in zf.infolist()
+                             if Path(m.filename).name == "v13_historical.db"), None)
+                if info:
+                    found.append((archive, info.filename, info.file_size, info.CRC))
+        except (zipfile.BadZipFile, OSError):
+            continue
+    return sorted(found, key=lambda item: item[2], reverse=True)
+
+
+def _v13_extract_archive(archive, member, expected_size, crc):
+    # Streamlit Cloud ha disco scrivibile temporaneo; resta valido tra i rerun.
+    cache = Path(tempfile.gettempdir()) / "v13_streamlit_history"
+    cache.mkdir(parents=True, exist_ok=True)
+    target = cache / f"v13_{expected_size}_{crc:08x}.db"
+    if target.is_file():
+        try:
+            return target, _v13_db_count(target)
+        except Exception:
+            target.unlink(missing_ok=True)
+    partial = cache / (target.name + ".partial")
+    try:
+        with st.spinner("Prima apertura: preparo il database V13 aggiornato..."):
+            with zipfile.ZipFile(archive, "r") as zf:
+                with zf.open(member) as source, partial.open("wb") as dest:
+                    shutil.copyfileobj(source, dest, length=8 * 1024 * 1024)
+        if partial.stat().st_size != expected_size:
+            raise RuntimeError("Estrazione incompleta del database V13")
+        count = _v13_db_count(partial)
+        os.replace(partial, target)
+        return target, count
+    finally:
+        partial.unlink(missing_ok=True)
+
+
+def _initialize_v13_db():
+    db_path = _configured_v13_db()
+    explicit = bool(os.environ.get("V13_DB_PATH"))
+    try:
+        explicit = explicit or bool(st.secrets.get("V13_DB_PATH"))
     except Exception:
         pass
-    env_path = os.getenv("V13_DB_PATH")
-    if env_path:
-        return Path(env_path).expanduser()
-    return Path(__file__).with_name("v13_historical.db")
+    # Se l'utente ha configurato un percorso preciso, rispettalo.
+    if explicit and db_path.is_file():
+        count = _v13_db_count(db_path)
+        if count < V13_DATABASE_MIN_MATCHES:
+            st.warning(f"Database esterno ancora vecchio: {count:,} gare")
+        return db_path, count
+
+    archives = _v13_archive_options()
+    # Priorita' al nuovo ZIP: sostituisce logicamente l'archivio vecchio,
+    # senza cancellare o modificare il file gia' presente su GitHub.
+    for archive, member, unpacked_bytes, crc in archives:
+        if unpacked_bytes < 60_000_000:
+            continue
+        db, count = _v13_extract_archive(archive, member, unpacked_bytes, crc)
+        if count >= V13_DATABASE_MIN_MATCHES:
+            return db, count
+
+    # Compatibilita' durante la migrazione: il vecchio software resta attivo
+    # fino a quando non viene caricato il nuovo v13_historical.zip.
+    if db_path.is_file():
+        count = _v13_db_count(db_path)
+        if count < V13_DATABASE_MIN_MATCHES:
+            st.warning(f"Archivio precedente ({count:,} gare). Carica v13_historical.zip aggiornato sul repository per passare automaticamente a 352.557 gare.")
+        return db_path, count
+    if archives:
+        archive, member, size, crc = archives[0]
+        db, count = _v13_extract_archive(archive, member, size, crc)
+        if count < V13_DATABASE_MIN_MATCHES:
+            st.warning(f"Archivio precedente ({count:,} gare). Carica il nuovo v13_historical.zip per aggiornare automaticamente i dati.")
+        return db, count
+    raise FileNotFoundError("Nessun v13_historical.db o v13_historical.zip disponibile")
 
 
-def ensure_db_available(db_path):
-    """Estrae automaticamente v13_historical.db da v13_historical.zip se necessario."""
-    db_path = Path(db_path)
-    if db_path.exists():
-        return db_path
-
-    # Se V13_DB_PATH punta a un percorso personalizzato, cerca prima lo ZIP accanto al DB.
-    zip_path = db_path.with_suffix(".zip")
-
-    # Fallback: ZIP nella stessa cartella dell'app (caso tipico Streamlit Cloud).
-    if not zip_path.exists():
-        zip_path = Path(__file__).with_name("v13_historical.zip")
-
-    if not zip_path.exists():
-        return db_path
-
-    try:
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            candidates = [
-                name for name in zf.namelist()
-                if Path(name).name == "v13_historical.db"
-            ]
-            if not candidates:
-                raise RuntimeError(
-                    f"Nel file {zip_path.name} non trovo v13_historical.db."
-                )
-
-            # Copia il DB nel percorso atteso dall'app, anche se nello ZIP e' dentro una sottocartella.
-            with zf.open(candidates[0], "r") as source, db_path.open("wb") as target:
-                shutil.copyfileobj(source, target)
-    except Exception as exc:
-        st.error(f"Errore nell'estrazione del database storico da {zip_path.name}: {exc}")
-        return db_path
-
-    return db_path
+def _v13_db_fingerprint(path):
+    info = Path(path).stat()
+    return info.st_size, info.st_mtime_ns
 
 
 API_KEY = get_api_key()
-DB_FILE = ensure_db_available(resolve_db_path())
+try:
+    DB_FILE, V13_DB_ROWS = _initialize_v13_db()
+except Exception as _db_exc:
+    st.error(f"Database V13: {_db_exc}")
+    st.stop()
 
 
 def num(v):
@@ -138,6 +209,30 @@ def pair_prob(over_odd, under_odd):
     return ia / (ia + ib)
 
 
+# Mediana dell'overround O/U osservata nel DB storico (~6,67%).
+# Viene usata SOLO se FootyStats fornisce un solo lato della quota O/U.
+OU_FALLBACK_OVERROUND = 1.0666666666666667
+
+
+def ou_prob(over_odd, under_odd):
+    """Probabilita' Over de-marginalizzata; tollera un solo lato quota mancante."""
+    a, b = num(over_odd), num(under_odd)
+
+    # Caso normale: entrambe le quote presenti -> logica originale IDENTICA.
+    if np.isfinite(a) and np.isfinite(b) and a > 1 and b > 1:
+        ia, ib = 1.0 / a, 1.0 / b
+        return ia / (ia + ib)
+
+    # Fallback prudente: una sola quota disponibile.
+    if np.isfinite(a) and a > 1:
+        return float(np.clip((1.0 / a) / OU_FALLBACK_OVERROUND, 0.0, 1.0))
+    if np.isfinite(b) and b > 1:
+        p_under = (1.0 / b) / OU_FALLBACK_OVERROUND
+        return float(np.clip(1.0 - p_under, 0.0, 1.0))
+
+    return np.nan
+
+
 def probs_1x2(a, b, c):
     vals = np.array([num(a), num(b), num(c)], dtype=float)
     if np.any(~np.isfinite(vals)) or np.any(vals <= 1):
@@ -153,9 +248,9 @@ def feature(d):
             p1,
             px,
             p2,
-            pair_prob(d.get("odds_ft_over15"), d.get("odds_ft_under15")),
-            pair_prob(d.get("odds_ft_over25"), d.get("odds_ft_under25")),
-            pair_prob(d.get("odds_ft_over35"), d.get("odds_ft_under35")),
+            ou_prob(d.get("odds_ft_over15"), d.get("odds_ft_under15")),
+            ou_prob(d.get("odds_ft_over25"), d.get("odds_ft_under25")),
+            ou_prob(d.get("odds_ft_over35"), d.get("odds_ft_under35")),
             pair_prob(d.get("odds_btts_yes"), d.get("odds_btts_no")),
         ],
         dtype=float,
@@ -210,9 +305,15 @@ def adaptive_market_sample(dist, acts, markets):
 
 
 @st.cache_resource(show_spinner=False)
-def load_live45_history(db_path_str):
+def load_live45_history(db_path_str, db_fingerprint):
+    """Precalcola una sola volta le caratteristiche e gli esiti per i 3 HT.
+
+    L'algoritmo Affini (normalizzazione, distanze, K adattivo, pesi) resta
+    quello precedente; lo rendiamo vettoriale per evitare di scandire lo
+    stesso archivio 3 volte per ogni partita della giornata.
+    """
     db_path = Path(db_path_str)
-    if not db_path.exists():
+    if not db_path.is_file():
         return None
 
     con = sqlite3.connect(str(db_path), check_same_thread=False)
@@ -226,32 +327,40 @@ def load_live45_history(db_path_str):
         "odds_ft_over35", "odds_ft_under35",
         "odds_btts_yes", "odds_btts_no",
     ]
-    rows = [dict(r) for r in con.execute(
-        f"""
-        SELECT {','.join(cols)}
-        FROM matches_v13
-        WHERE status='complete'
-          AND result_1x2 IN ('1','X','2')
-          AND ht_goals_team_a IS NOT NULL
-          AND ht_goals_team_b IS NOT NULL
-          AND date_unix < CAST(strftime('%s','now') AS INTEGER)
-        ORDER BY date_unix, match_id
-        """
-    )]
-    con.close()
-
+    try:
+        rows = [dict(r) for r in con.execute(
+            f"SELECT {','.join(cols)} FROM matches_v13 "
+            "WHERE status='complete' AND result_1x2 IN ('1','X','2') "
+            "AND ht_goals_team_a IS NOT NULL AND ht_goals_team_b IS NOT NULL "
+            "AND date_unix < CAST(strftime('%s','now') AS INTEGER) "
+            "ORDER BY date_unix, match_id"
+        )]
+    finally:
+        con.close()
     if not rows:
         return None
 
-    X = np.vstack([feature(r) for r in rows])
-    valid = np.all(np.isfinite(X), axis=1)
+    raw = np.vstack([feature(r) for r in rows])
+    valid = np.all(np.isfinite(raw), axis=1)
     rows = [r for r, ok in zip(rows, valid) if ok]
-    X = X[valid]
-    if not rows:
+    raw = raw[valid]
+    if len(rows) == 0:
         return None
-
-    med, iqr, Z = robust_scale(X)
-    return rows, Z, med, iqr
+    med, iqr, Z = robust_scale(raw)
+    n = len(rows)
+    ht_h = np.fromiter((int(r["ht_goals_team_a"]) for r in rows), dtype=np.int16, count=n)
+    ht_a = np.fromiter((int(r["ht_goals_team_b"]) for r in rows), dtype=np.int16, count=n)
+    hg = np.fromiter((int(r["home_goals"]) for r in rows), dtype=np.int16, count=n)
+    ag = np.fromiter((int(r["away_goals"]) for r in rows), dtype=np.int16, count=n)
+    dates = np.fromiter((int(r["date_unix"]) for r in rows), dtype=np.int64, count=n)
+    # Sette mercati usati per decidere l'ampiezza del campione adattivo V13.
+    h2, a2 = np.maximum(hg - ht_h, 0), np.maximum(ag - ht_a, 0)
+    outcomes = np.column_stack((
+        hg > ag, hg == ag, hg < ag, (hg + ag) >= 3,
+        (hg >= 1) & (ag >= 1), h2 >= 1, a2 >= 1,
+        (h2 + a2) >= 1,  # ottava colonna: almeno un gol nel secondo tempo
+    )).astype(np.float64)
+    return Z, med, iqr, ht_h, ht_a, dates, outcomes
 
 
 def live45_actuals(r):
@@ -266,6 +375,7 @@ def live45_actuals(r):
         "1": float(hg > ag),
         "X": float(hg == ag),
         "2": float(hg < ag),
+        "Gol nel 2T": float(h2 + a2 >= 1),
         "Over 0.5 FT": float(total >= 1),
         "Over 2.5 FT": float(total >= 3),
         "Gol FT": float(hg >= 1 and ag >= 1),
@@ -274,45 +384,54 @@ def live45_actuals(r):
     }
 
 
-def over05_second_half_if_ht00(match):
-    loaded = load_live45_history(str(DB_FILE))
-    if not loaded:
-        return np.nan
+def second_half_goal_probability(match, ht_home, ht_away):
+    """Probabilita' di almeno 1 gol nel 2T, condizionata al risultato HT.
 
-    rows, Z, med, iqr = loaded
-    cutoff = int(num(match.get("date_unix"))) if np.isfinite(num(match.get("date_unix"))) else int(datetime.now().timestamp())
-    idx = [
-        i for i, r in enumerate(rows)
-        if int(r["ht_goals_team_a"]) == 0
-        and int(r["ht_goals_team_b"]) == 0
-        and int(r["date_unix"]) < cutoff
-    ]
+    Algoritmo V13 in forma vettoriale: nessun dato futuro rispetto al target,
+    scala robusta dell'archivio completo, distanze RMS fra quote,
+    campione 300/500/... adattivo con delta <=2,5 pp e crescita <=1,30,
+    e media pesata 1/(distanza+0,15).
+    """
+    loaded = load_live45_history(str(DB_FILE), _v13_db_fingerprint(DB_FILE))
+    if loaded is None:
+        return np.nan
+    Z, med, iqr, ht_h, ht_a, dates, outcomes = loaded
+    raw_date = num(match.get("date_unix"))
+    cutoff = int(raw_date) if np.isfinite(raw_date) else int(datetime.now().timestamp())
+    idx = np.flatnonzero((ht_h == int(ht_home)) & (ht_a == int(ht_away)) & (dates < cutoff))
     if len(idx) < 30:
         return np.nan
 
     target = feature(match)
     if not np.all(np.isfinite(target)):
         return np.nan
-
     zt = (target - med) / iqr
-    Zi = Z[idx]
-    dist = np.sqrt(np.mean(np.square(Zi - zt), axis=1))
-    subset = [rows[i] for i in idx]
-    acts = [live45_actuals(r) for r in subset]
+    ds = np.sqrt(np.mean(np.square(Z[idx] - zt), axis=1))
+    order = np.argsort(ds)
+    available = len(order)
+    first_k = min(MIN_K, available)
 
-    stability_markets = [
-        "1", "X", "2", "Over 2.5 FT", "Gol FT",
-        "Casa segna ancora", "Trasferta segna ancora",
-    ]
-    _, _, chosen = adaptive_market_sample(dist, acts, stability_markets)
-    all_markets = list(acts[0].keys())
-    probabilities, _ = probabilities_for_positions(chosen, dist, acts, all_markets)
-    # Con HT 0-0, Over 0.5 FT equivale ad almeno un gol nel secondo tempo.
-    return probabilities.get("Over 0.5 FT", np.nan)
+    def summary(k):
+        chosen = order[:k]
+        w = 1.0 / (ds[chosen] + 0.15)
+        prob = np.average(outcomes[idx[chosen]], axis=0, weights=w)
+        return prob, float(ds[chosen][-1])
+
+    chosen_k = first_k
+    previous, previous_max_dist = summary(first_k)
+    for k in [x for x in CANDIDATE_K if first_k < x <= available]:
+        current, max_dist = summary(k)
+        delta = float(np.max(np.abs(current[:7] - previous[:7])))
+        growth = max_dist / previous_max_dist if previous_max_dist > 0 else 1.0
+        if delta > MAX_STABILITY_DELTA or growth > MAX_DISTANCE_GROWTH:
+            break
+        chosen_k = k
+        previous, previous_max_dist = current, max_dist
+    return float(previous[7])
 
 
 @st.cache_data(show_spinner=False)
-def load_league_map(db_path_str):
+def load_league_map(db_path_str, db_fingerprint):
     con = sqlite3.connect(db_path_str)
     con.row_factory = sqlite3.Row
     league_map = {}
@@ -426,7 +545,7 @@ def pct_text(value):
 
 
 def build_candidates(chosen_day):
-    league_map = load_league_map(str(DB_FILE))
+    league_map = load_league_map(str(DB_FILE), _v13_db_fingerprint(DB_FILE))
     fixtures = get_day_matches(chosen_day.isoformat())
 
     # Prima identifichiamo le sole competizioni ammesse, cosi evitiamo chiamate /match inutili.
@@ -450,21 +569,32 @@ def build_candidates(chosen_day):
         if lg not in SELECTED_LEAGUES:
             continue
 
-        p_o15 = pair_prob(match.get("odds_ft_over15"), match.get("odds_ft_under15"))
-        p_o25 = pair_prob(match.get("odds_ft_over25"), match.get("odds_ft_under25"))
+        p_o15 = ou_prob(match.get("odds_ft_over15"), match.get("odds_ft_under15"))
+        p_o25 = ou_prob(match.get("odds_ft_over25"), match.get("odds_ft_under25"))
         if not (np.isfinite(p_o15) and np.isfinite(p_o25)):
             continue
         if p_o15 < O15_MIN or p_o25 < O25_MIN:
             continue
 
-        p_o05_2h = over05_second_half_if_ht00(match)
+        scores = [(0, 0), (1, 0), (0, 1)]
+        live_probs = {
+            ht: second_half_goal_probability(match, ht[0], ht[1])
+            for ht in scores
+        }
+        qualifying = [
+            f"{ht[0]}-{ht[1]}" for ht, p in live_probs.items()
+            if np.isfinite(p) and p >= LIVE_MIN
+        ]
         rows.append(
             {
                 "Campionato": lg,
                 "Partita": f"{team_name(match, 'home')} - {team_name(match, 'away')}",
                 "O1.5 pre": pct_text(p_o15),
                 "O2.5 pre": pct_text(p_o25),
-                "O0.5 2T se HT 0-0": pct_text(p_o05_2h),
+                "Gol 2T se HT 0-0": pct_text(live_probs[(0, 0)]),
+                "Gol 2T se HT 1-0": pct_text(live_probs[(1, 0)]),
+                "Gol 2T se HT 0-1": pct_text(live_probs[(0, 1)]),
+                "HT con LIVE >=80%": ", ".join(qualifying) if qualifying else "Nessuno",
                 "_date_unix": int(num(match.get("date_unix"))) if np.isfinite(num(match.get("date_unix"))) else 0,
             }
         )
@@ -478,7 +608,7 @@ def build_candidates(chosen_day):
 def main():
     st.markdown('<div class="goal2t-title">Candidate Gol 2° Tempo</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="goal2t-sub">Filtro fisso: O1.5 pre ≥ 80% · O2.5 pre ≥ 60% · O0.5 2T calcolato ipotizzando 0-0 all’intervallo</div>',
+        '<div class="goal2t-sub">10 leghe · O1.5 pre ≥ 84% · O2.5 pre ≥ 60% · Affini LIVE ≥ 80% · HT 0-0 / 1-0 / 0-1</div>',
         unsafe_allow_html=True,
     )
 
@@ -503,6 +633,8 @@ def main():
         if st.button("Aggiorna dati", use_container_width=True):
             get_day_matches.clear()
             get_match_detail.clear()
+            load_live45_history.clear()
+            load_league_map.clear()
             st.rerun()
 
     try:
@@ -516,10 +648,15 @@ def main():
         st.stop()
 
     st.markdown(f"### {len(candidates)} partite candidate")
-    st.caption(f"Partite ricevute da FootyStats per la data: {total_fixtures}. Sono mostrate solo le competizioni concordate e le partite che superano entrambi i filtri pre-match.")
+    st.caption(
+        f"Archivio V13: {V13_DB_ROWS:,} partite · FootyStats oggi: {total_fixtures}. "
+        "Le percentuali LIVE sono ipotesi calcolate per ciascun risultato HT; "
+        "considera valida soltanto la colonna corrispondente al risultato reale all'intervallo "
+        "e solo se almeno 80%."
+    )
 
     if not candidates:
-        st.info("Nessuna partita della giornata rispetta contemporaneamente O1.5 ≥80% e O2.5 ≥60%.")
+        st.info("Nessuna partita della giornata rispetta contemporaneamente O1.5 ≥84% e O2.5 ≥60%.")
     else:
         df = pd.DataFrame(candidates)
         st.dataframe(
@@ -531,7 +668,10 @@ def main():
                 "Partita": st.column_config.TextColumn(width="large"),
                 "O1.5 pre": st.column_config.TextColumn(width="small"),
                 "O2.5 pre": st.column_config.TextColumn(width="small"),
-                "O0.5 2T se HT 0-0": st.column_config.TextColumn(width="medium"),
+                "Gol 2T se HT 0-0": st.column_config.TextColumn(width="medium"),
+                "Gol 2T se HT 1-0": st.column_config.TextColumn(width="medium"),
+                "Gol 2T se HT 0-1": st.column_config.TextColumn(width="medium"),
+                "HT con LIVE >=80%": st.column_config.TextColumn(width="medium"),
             },
         )
 
